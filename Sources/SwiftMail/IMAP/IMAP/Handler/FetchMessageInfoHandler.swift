@@ -11,6 +11,12 @@ import NIOConcurrencyHelpers
 final class FetchMessageInfoHandler: BaseIMAPCommandHandler<[MessageInfo]>, IMAPCommandHandler, @unchecked Sendable {
     /// Collected email headers
     private var messageInfos: [MessageInfo] = []
+
+    /// Buffer for accumulating streaming header bytes
+    private var headerBuffer: Data = Data()
+
+    /// Whether we're currently streaming header data
+    private var isStreamingHeaders: Bool = false
     
     /// Handle a tagged OK response by succeeding the promise with the mailbox info
     /// - Parameter response: The tagged response
@@ -60,18 +66,106 @@ final class FetchMessageInfoHandler: BaseIMAPCommandHandler<[MessageInfo]>, IMAP
                 }
                 
             case .streamingBegin(_, _):
-                // We don't create headers for streamingBegin
-                // This avoids misinterpreting the byte count as a sequence number
-                break
-                
-            case .streamingBytes(_):
-                // Process streaming bytes if needed
-                // For headers, we typically don't need to process the raw header data
-                break
-                
+                // Start accumulating header bytes
+                lock.withLock {
+                    self.headerBuffer.removeAll(keepingCapacity: true)
+                    self.isStreamingHeaders = true
+                }
+
+            case .streamingBytes(let data):
+                // Accumulate streaming header bytes
+                if isStreamingHeaders {
+                    lock.withLock {
+                        self.headerBuffer.append(Data(data.readableBytesView))
+                    }
+                }
+
+            case .finish:
+                // Streaming complete - parse the accumulated headers
+                finalizeCurrentMessageHeaders()
+
             default:
                 break
         }
+    }
+
+    /// Parse accumulated header bytes and populate additionalFields on the current message
+    private func finalizeCurrentMessageHeaders() {
+        guard isStreamingHeaders else { return }
+
+        lock.withLock {
+            self.isStreamingHeaders = false
+
+            guard !self.headerBuffer.isEmpty,
+                  let lastIndex = self.messageInfos.indices.last else {
+                return
+            }
+
+            // Parse the raw headers
+            if let headerText = String(data: self.headerBuffer, encoding: .utf8)
+                ?? String(data: self.headerBuffer, encoding: .isoLatin1) {
+                let parsedHeaders = parseRFC5322Headers(headerText)
+                if !parsedHeaders.isEmpty {
+                    self.messageInfos[lastIndex].additionalFields = parsedHeaders
+                }
+            }
+
+            self.headerBuffer.removeAll(keepingCapacity: true)
+        }
+    }
+
+    /// Parse RFC 5322 headers from raw text
+    /// - Parameter headerText: The raw header text
+    /// - Returns: A dictionary of header names to values
+    private func parseRFC5322Headers(_ headerText: String) -> [String: String] {
+        var headers: [String: String] = [:]
+
+        // RFC 5322 headers are "Name: Value" format, with continuation lines starting with whitespace
+        // Split into lines and handle folded headers
+        let lines = headerText.components(separatedBy: "\r\n")
+        var currentHeader: String?
+        var currentValue: String = ""
+
+        for line in lines {
+            if line.isEmpty {
+                // Empty line marks end of headers
+                break
+            }
+
+            // Check if this is a continuation line (starts with whitespace)
+            if line.hasPrefix(" ") || line.hasPrefix("\t") {
+                // Continuation of previous header - append to current value
+                currentValue += " " + line.trimmingCharacters(in: .whitespaces)
+            } else if let colonIndex = line.firstIndex(of: ":") {
+                // Save previous header if exists
+                if let header = currentHeader, !currentValue.isEmpty {
+                    // Store with lowercase key for consistent lookup
+                    let key = header.lowercased()
+                    // If header already exists, append (some headers like Received appear multiple times)
+                    if let existing = headers[key] {
+                        headers[key] = existing + ", " + currentValue
+                    } else {
+                        headers[key] = currentValue
+                    }
+                }
+
+                // Start new header
+                currentHeader = String(line[..<colonIndex]).trimmingCharacters(in: .whitespaces)
+                currentValue = String(line[line.index(after: colonIndex)...]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+
+        // Don't forget the last header
+        if let header = currentHeader, !currentValue.isEmpty {
+            let key = header.lowercased()
+            if let existing = headers[key] {
+                headers[key] = existing + ", " + currentValue
+            } else {
+                headers[key] = currentValue
+            }
+        }
+
+        return headers
     }
     
     /// Process a message attribute and update the corresponding email header
